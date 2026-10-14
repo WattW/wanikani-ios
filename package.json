@@ -1,0 +1,9 @@
+{
+  "name": "wanikani-ios-review-priority",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WaniKani review ordering for Userscripts and Safari on iOS",
+  "scripts": { "test": "node --test", "check": "node --check wanikani-review-priority.user.js" },
+  "engines": { "node": ">=20" },
+  "license": "MIT"
+}
