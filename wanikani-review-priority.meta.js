@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WaniKani Review Priority for iOS
 // @namespace    https://github.com/WattW/wanikani-ios
-// @version      1.0.0
-// @description  Reviews: current-level radicals, current-level kanji, other radicals, other kanji, then all vocabulary.
+// @version      1.1.0
+// @description  Priority reviews, current-level mistake protection and answer fill, plus correct-answer reveal.
 // @author       WattW
 // @license      MIT
 // @match        https://www.wanikani.com/*

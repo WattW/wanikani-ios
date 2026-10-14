@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WaniKani Review Priority for iOS
 // @namespace    https://github.com/WattW/wanikani-ios
-// @version      1.0.0
-// @description  Reviews: current-level radicals, current-level kanji, other radicals, other kanji, then all vocabulary.
+// @version      1.1.0
+// @description  Priority reviews, current-level mistake protection and answer fill, plus correct-answer reveal.
 // @author       WattW
 // @license      MIT
 // @match        https://www.wanikani.com/*
@@ -46,8 +46,7 @@
     return { subjects: subjects.slice().sort((a, b) => ranks.get(a.id) - ranks.get(b.id)), ranks };
   }
 
-  // Only public queue fields are changed. WaniKani retains its stats, SRS, answer
-  // checker, completion requests, question order, and wrap-up implementation.
+  // Queue ordering retains WaniKani's stats, SRS, question order, and Wrap Up.
   function installQueueOrder(queue, ordered, ranks, onNext) {
     const ids = [...queue.activeQueue, ...queue.backlogQueue].map(item => item.id).concat(queue.remainingIds);
     if (ids.length !== ordered.length || new Set(ids).size !== ids.length || ids.some(id => !ranks.has(id))) {
@@ -89,8 +88,105 @@
     return null;
   }
 
+  function correctAnswers(subject, questionType) {
+    if (!subject || !['meaning', 'reading'].includes(questionType)) return [];
+    const accepted = new Set(['primary', 'alternative', 'allowed']);
+    const entries = questionType === 'meaning' ? subject.meanings : subject.readings;
+    const answers = (entries || []).filter(entry => {
+      if (!accepted.has(entry.kind) || typeof entry.text !== 'string' || !entry.text.trim()) return false;
+      // An alternate reading type may trigger a native retry, not a pass.
+      if (questionType === 'reading' && subject.type === 'Kanji') {
+        return entry.kind === 'allowed' || entry.type === subject.primary_reading_type;
+      }
+      return questionType === 'meaning' || subject.type === 'Vocabulary';
+    }).sort((a, b) => Number(b.kind === 'primary') - Number(a.kind === 'primary'));
+    return [...new Set(answers.map(entry => entry.text.trim()))];
+  }
+
+  function isCurrentLevel(subject, metadata, level) {
+    return !!subject && validLevel(level) !== null && validLevel(metadata.get(subject.id)?.level) === level;
+  }
+
+  function fillCorrectAnswer(controller, metadata, level) {
+    const input = controller.inputTarget;
+    if (!isCurrentLevel(controller.currentSubject, metadata, level) || !controller.inputEnabled ||
+        controller.submitting || input.disabled || input.readOnly) return false;
+    const answer = correctAnswers(controller.currentSubject, controller.currentQuestionType)[0];
+    if (!answer) return false;
+    input.value = answer;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    controller.inputChars = answer;
+    controller.clearException();
+    input.focus();
+    input.setSelectionRange(answer.length, answer.length);
+    return true;
+  }
+
+  function installAnswerAssistance(controller, metadata, level, { onWrong, onResult } = {}) {
+    const checker = controller.answerChecker;
+    if (typeof checker?.evaluate !== 'function' || typeof controller.shakeForm !== 'function' ||
+        typeof controller.submitAnswer !== 'function') throw new Error('WaniKani’s answer interface has changed.');
+    const original = { evaluate: checker.evaluate, shake: controller.shakeForm, submit: controller.submitAnswer };
+    let attempt = null;
+    // A display failure must never change how an answer is graded.
+    const notify = (callback, ...args) => {
+      try { callback?.(...args); } catch (error) { console.warn('[WaniKani Review Priority]', error); }
+    };
+    const evaluate = function (args) {
+      const result = original.evaluate.call(this, args);
+      const protectedItem = isCurrentLevel(args.item, metadata, level);
+      if (result.action === 'fail' || result.action === 'retry') {
+        notify(onWrong, args.item, args.questionType);
+      }
+      const adjusted = result.action === 'fail' && protectedItem ? {
+        ...result, action: 'retry', message: {
+          type: 'answerException',
+          text: 'Current-level protection: try again. This attempt was not counted wrong.'
+        }
+      } : result;
+      // Repeated taps must not resubmit the same rejected answer automatically.
+      if (adjusted.action === 'retry') controller.nextPending = false;
+      notify(onResult, adjusted);
+      return adjusted;
+    };
+    const shake = function (...args) {
+      if (attempt) attempt.shook = true;
+      // Also cover native validation before evaluate (e.g. kana in a meaning
+      // field). Empty submissions shake normally without revealing the answer.
+      if (this.inputTarget.value.trim()) notify(onWrong, this.currentSubject, this.currentQuestionType);
+      return original.shake.apply(this, args);
+    };
+    const submit = async function (...args) {
+      if (this.submitting) return original.submit.apply(this, args);
+      const currentAttempt = { shook: false };
+      attempt = currentAttempt;
+      try { return await original.submit.apply(this, args); }
+      finally {
+        if (attempt === currentAttempt) {
+          attempt = null;
+          // Native pre-validation can return early after shaking. Keep retries
+          // editable, including when the iOS keyboard submits twice quickly.
+          if (currentAttempt.shook) {
+            this.inputEnabled = true;
+            this.submitting = false;
+            this.nextPending = false;
+          }
+        }
+      }
+    };
+    checker.evaluate = evaluate;
+    controller.shakeForm = shake;
+    controller.submitAnswer = submit;
+    return () => {
+      if (checker.evaluate === evaluate) checker.evaluate = original.evaluate;
+      if (controller.shakeForm === shake) controller.shakeForm = original.shake;
+      if (controller.submitAnswer === submit) controller.submitAnswer = original.submit;
+    };
+  }
+
   if (typeof module === 'object' && module.exports) {
-    module.exports = { validLevel, priority, orderSubjects, installQueueOrder, levelFromDocument };
+    module.exports = { validLevel, priority, orderSubjects, installQueueOrder, levelFromDocument,
+      correctAnswers, isCurrentLevel, fillCorrectAnswer, installAnswerAssistance };
     return;
   }
   if (window.top !== window.self || window.__wkReviewPriorityInstalled) return;
@@ -116,6 +212,11 @@
       .wk-priority-dialog button { min-height:44px; padding:8px 14px; border:1px solid #aaa; border-radius:8px; background:#f4f4f4; color:#222; font:inherit; margin:8px 8px 0 0; }
       .wk-priority-dialog input { width:90px; min-height:44px; margin:8px; font:inherit; }
       #wk-priority-status { position:fixed; z-index:1000; top:calc(env(safe-area-inset-top,0px) + 6px); left:50%; transform:translateX(-50%); max-width:65vw; min-height:32px; padding:5px 10px; border:1px solid #666; border-radius:16px; background:#fff; color:#222; font:12px/1.3 -apple-system,BlinkMacSystemFont,sans-serif; }
+      #wk-priority-assist { padding:8px 12px; text-align:center; font:15px/1.5 -apple-system,BlinkMacSystemFont,sans-serif; }
+      #wk-priority-assist button { min-height:44px; padding:8px 16px; border:1px solid #999; border-radius:9px; color:#222; background:#fff; font:inherit; }
+      #wk-priority-assist button:disabled { opacity:.5; }
+      #wk-priority-assist [hidden] { display:none !important; }
+      #wk-priority-answer { margin:8px auto 0; max-width:600px; padding:10px 14px; border:1px solid #b9a34a; border-radius:9px; background:#fff8d9; color:#29230d; overflow-wrap:anywhere; }
     `;
     (document.head || document.documentElement).append(el);
   }
@@ -148,6 +249,53 @@
     el.id = 'wk-priority-status';
     el.setAttribute('aria-label', `${text}. Show review ordering details`);
     return el;
+  }
+
+  function addAnswerControls(controller, metadata, level) {
+    document.getElementById('wk-priority-assist')?.remove();
+    const container = document.createElement('div');
+    container.id = 'wk-priority-assist';
+    const cheat = button(container, 'Cheat · Fill answer', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      fillCorrectAnswer(controller, metadata, level);
+    });
+    const reveal = document.createElement('div');
+    reveal.id = 'wk-priority-answer';
+    reveal.setAttribute('role', 'status');
+    reveal.setAttribute('aria-live', 'polite');
+    reveal.hidden = true;
+    container.append(reveal);
+    controller.element.append(container);
+    const refresh = (subject, questionType) => {
+      cheat.hidden = !isCurrentLevel(subject, metadata, level) || !correctAnswers(subject, questionType).length;
+      cheat.disabled = false;
+      reveal.hidden = true;
+      reveal.replaceChildren();
+    };
+    const next = event => refresh(event.detail.subject, event.detail.questionType);
+    window.addEventListener('willShowNextQuestion', next);
+    refresh(controller.currentSubject, controller.currentQuestionType);
+    let restore;
+    const cleanup = () => {
+      restore?.();
+      window.removeEventListener('willShowNextQuestion', next);
+      container.remove();
+    };
+    try {
+      restore = installAnswerAssistance(controller, metadata, level, {
+        onWrong(subject, questionType) {
+          const answers = correctAnswers(subject, questionType);
+          const text = document.createElement('span');
+          text.textContent = answers.length ? answers.join(' / ') : 'Unavailable; open WaniKani’s item information.';
+          if (questionType === 'reading') text.lang = 'ja';
+          reveal.replaceChildren(document.createTextNode(`Correct ${questionType}: `), text);
+          reveal.hidden = false;
+        },
+        onResult(result) { cheat.disabled = result.action === 'pass' || result.action === 'fail'; }
+      });
+    } catch (error) { cleanup(); throw error; }
+    return cleanup;
   }
 
   async function fetchText(path, signal) {
@@ -214,7 +362,9 @@
     for (let i = 0; i < 100; i++) {
       if (signal.aborted) throw new Error('Reordering canceled.');
       const queue = getQueue(element);
-      if (queue) return queue;
+      const inputElement = document.querySelector('[data-controller~="quiz-input"]');
+      const input = inputElement && window.Stimulus?.getControllerForElementAndIdentifier(inputElement, 'quiz-input');
+      if (queue && input?.answerChecker) return { queue, input };
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     throw new Error('WaniKani’s review queue is unavailable. Check that Userscripts has website access, then reload.');
@@ -238,7 +388,7 @@
     const canceled = new Promise((_, reject) => abort.signal.addEventListener('abort', () => reject(new Error('Reordering canceled or timed out.')), { once: true }));
     let timeout = setTimeout(cancel, 45000);
     try {
-      const queue = await Promise.race([waitForQueue(element, abort.signal), canceled]);
+      const { queue, input } = await Promise.race([waitForQueue(element, abort.signal), canceled]);
       if (answered.has(element)) throw new Error('Reviews have already started. Reload to apply priority before answering.');
       if (!Array.isArray(queue.activeQueue) || !Array.isArray(queue.backlogQueue) || !Array.isArray(queue.remainingIds) ||
           !Number.isInteger(queue.maxActiveQueueSize) || queue.maxActiveQueueSize < 1 || typeof queue.nextItem !== 'function') {
@@ -256,16 +406,18 @@
         GROUPS.forEach((name, i) => { const li = document.createElement('li'); li.textContent = `${name}: ${counts[i]}`; list.append(li); });
         info.el.append(list);
         const note = document.createElement('p');
-        note.textContent = 'Level is fixed for this session. Reload to detect a level-up. To turn off reordering, disable this script in Userscripts and reload. Use only one review-ordering script at a time.';
+        note.textContent = 'Current-level mistakes are retried without penalty, and the Cheat button fills the answer. All incorrect answers reveal the correct answer. Level is fixed for this session; reload after leveling up. Disable this script and reload to restore normal reviews. Use only one review-ordering or answer-modifying script at a time.';
         info.el.append(note);
         button(info.el, 'Close', () => info.el.remove());
         info.el.addEventListener('close', () => info.el.remove());
       };
       const badge = status(`Priority · Level ${level}`, details);
+      session.cleanup = addAnswerControls(input, data.metadata, level);
       installQueueOrder(queue, subjects, ranks, group => {
         badge.textContent = group === null ? 'Priority · Complete' : `L${level} · ${GROUPS[group]}`;
       });
     } catch (error) {
+      session.cleanup?.();
       if (activeSession === session && isReview()) {
         console.warn('[WaniKani Review Priority]', error.message);
         status('Priority off · Tap for details', () => {
@@ -286,9 +438,11 @@
     if (element) answered.add(element);
   });
   document.addEventListener('turbo:before-cache', () => {
+    activeSession?.cleanup?.();
     document.querySelectorAll('.wk-priority-dialog, #wk-priority-status').forEach(el => el.remove());
   });
   document.addEventListener('turbo:before-render', () => {
+    activeSession?.cleanup?.();
     activeSession?.abort.abort();
     activeSession?.panel?.remove();
     activeSession = null;
